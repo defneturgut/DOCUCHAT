@@ -222,3 +222,180 @@ class VectorStore:
 
     def total_chunks(self) -> int:
         return self._collection.count()
+##################################################update
+"""
+ChromaDB vektör veritabanı servisi.
+Google Embedding — doğrudan google-generativeai kütüphanesi ile.
+"""
+import uuid
+import logging
+from datetime import datetime
+from typing import Optional
+
+import chromadb
+import google.generativeai as genai
+from chromadb.config import Settings as ChromaSettings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+from core.config import get_settings
+from core.models import DocumentInfo, ChatSource
+
+logger = logging.getLogger(__name__)
+settings = get_settings()
+
+# Google API'yi yapılandır
+genai.configure(api_key=settings.google_api_key)
+
+
+def _embed_texts(texts: list[str]) -> list[list[float]]:
+    """Google Generative AI ile metin listesini vektöre çevirir."""
+    result = genai.embed_content(
+        model="models/gemini-embedding-001",
+        content=texts,
+        task_type="retrieval_document",
+    )
+    return result["embedding"] if isinstance(texts, str) else result["embedding"]
+
+
+def _embed_query(text: str) -> list[float]:
+    """Tek bir sorguyu vektöre çevirir."""
+    result = genai.embed_content(
+        model="models/gemini-embedding-001",
+        content=text,
+        task_type="retrieval_query",
+    )
+    return result["embedding"]
+
+
+class VectorStore:
+    def __init__(self):
+        self._client = chromadb.PersistentClient(
+            path=settings.chroma_persist_dir,
+            settings=ChromaSettings(anonymized_telemetry=False),
+        )
+        self._collection = self._client.get_or_create_collection(
+            name="docuchat",
+            metadata={"hnsw:space": "cosine"},
+        )
+        self._splitter = RecursiveCharacterTextSplitter(
+            chunk_size=settings.chunk_size,
+            chunk_overlap=settings.chunk_overlap,
+            separators=["\n\n", "\n", ". ", " ", ""],
+        )
+        logger.info("VectorStore başlatıldı. Mevcut chunk sayısı: %d", self._collection.count())
+
+    def add_document(self, text: str, filename: str, file_type: str, file_size_kb: float) -> DocumentInfo:
+        doc_id = str(uuid.uuid4())
+        chunks = self._splitter.split_text(text)
+
+        if not chunks:
+            raise ValueError("Chunk oluşturulamadı.")
+
+        logger.info("'%s' için %d chunk oluşturuldu.", filename, len(chunks))
+
+        # Google embed_content — batch olarak gönder
+        result = genai.embed_content(
+            model="models/gemini-embedding-001",
+            content=chunks,
+            task_type="retrieval_document",
+        )
+        embeddings = result["embedding"]
+
+        chunk_ids = [f"{doc_id}_chunk_{i}" for i in range(len(chunks))]
+        metadatas = [
+            {
+                "doc_id": doc_id,
+                "filename": filename,
+                "file_type": file_type,
+                "chunk_index": i,
+                "total_chunks": len(chunks),
+                "uploaded_at": datetime.now().isoformat(),
+            }
+            for i in range(len(chunks))
+        ]
+
+        self._collection.add(
+            ids=chunk_ids,
+            embeddings=embeddings,
+            documents=chunks,
+            metadatas=metadatas,
+        )
+
+        logger.info("Doküman '%s' (id=%s) eklendi.", filename, doc_id)
+        return DocumentInfo(
+            doc_id=doc_id,
+            filename=filename,
+            file_type=file_type,
+            chunk_count=len(chunks),
+            size_kb=file_size_kb,
+        )
+
+    def search(self, question: str, doc_ids: Optional[list[str]] = None, top_k: Optional[int] = None) -> list[ChatSource]:
+        k = top_k or settings.top_k_results
+        total = self._collection.count()
+        if total == 0:
+            return []
+        k = min(k, total)
+
+        # Soruyu vektöre çevir
+        result = genai.embed_content(
+            model="models/gemini-embedding-001",
+            content=question,
+            task_type="retrieval_query",
+        )
+        question_embedding = result["embedding"]
+
+        where_filter = {"doc_id": {"$in": doc_ids}} if doc_ids else None
+
+        results = self._collection.query(
+            query_embeddings=[question_embedding],
+            n_results=k,
+            where=where_filter,
+            include=["documents", "metadatas", "distances"],
+        )
+
+        sources = []
+        for doc_text, meta, distance in zip(
+            results["documents"][0],
+            results["metadatas"][0],
+            results["distances"][0],
+        ):
+            score = max(0.0, 1.0 - distance)
+            sources.append(ChatSource(
+                doc_id=meta["doc_id"],
+                filename=meta["filename"],
+                chunk_text=doc_text[:400] + ("..." if len(doc_text) > 400 else ""),
+                relevance_score=round(score, 3),
+            ))
+
+        return sources
+
+    def delete_document(self, doc_id: str) -> int:
+        results = self._collection.get(where={"doc_id": doc_id})
+        chunk_ids = results["ids"]
+        if not chunk_ids:
+            return 0
+        self._collection.delete(ids=chunk_ids)
+        logger.info("Doküman %s silindi (%d chunk).", doc_id, len(chunk_ids))
+        return len(chunk_ids)
+
+    def list_documents(self) -> list[DocumentInfo]:
+        if self._collection.count() == 0:
+            return []
+        all_meta = self._collection.get(include=["metadatas"])["metadatas"]
+        seen: dict[str, DocumentInfo] = {}
+        for meta in all_meta:
+            doc_id = meta["doc_id"]
+            if doc_id not in seen:
+                seen[doc_id] = DocumentInfo(
+                    doc_id=doc_id,
+                    filename=meta["filename"],
+                    file_type=meta["file_type"],
+                    chunk_count=meta["total_chunks"],
+                    uploaded_at=datetime.fromisoformat(meta["uploaded_at"]),
+                    size_kb=0.0,
+                )
+        return list(seen.values())
+
+    def total_chunks(self) -> int:
+        return self._collection.count()
