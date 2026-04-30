@@ -108,3 +108,6 @@ Doküman Yükleme:
 Sorgulama:
   Soru → Google Embedding → ChromaDB similarity search (top-5)
        → Prompt template → Groq LLM → Streaming yanıt + kaynaklar
+
+
+
