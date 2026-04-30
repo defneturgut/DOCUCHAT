@@ -5,7 +5,6 @@ Sistem sağlık kontrolü endpoint'i.
 from fastapi import APIRouter, Depends
 from core.models import HealthResponse
 from services.vector_store import VectorStore
-from services.llm import LLMService
 
 router = APIRouter(prefix="/api", tags=["system"])
 
@@ -15,28 +14,27 @@ def get_vector_store() -> VectorStore:
     return vector_store
 
 
-def get_llm_service() -> LLMService:
-    from main import llm_service
-    return llm_service
-
-
 @router.get("/health", response_model=HealthResponse)
-async def health_check(
-    vs: VectorStore = Depends(get_vector_store),
-    llm: LLMService = Depends(get_llm_service),
-):
-    """Tüm servislerin canlı olup olmadığını kontrol eder."""
-    groq_ok = await llm.health_check()
+async def health_check(vs: VectorStore = Depends(get_vector_store)):
+    """Tüm servislerin durumunu kontrol eder."""
 
-    # Google embedding'i hafifçe test et
+    # Groq kontrolü — sadece API key var mı diye bak, istek atma
+    from core.config import get_settings
+    import os
+    s = get_settings()
+    groq_ok = bool(s.groq_api_key and s.groq_api_key.startswith("gsk_"))
+
+    # Google kontrolü — küçük bir embed isteği at
     try:
-        from langchain_google_genai import GoogleGenerativeAIEmbeddings
-        from core.config import get_settings
-        s = get_settings()
-        emb = GoogleGenerativeAIEmbeddings(model=s.embedding_model, google_api_key=s.google_api_key)
-        emb.embed_query("test")
-        google_ok = True
-    except Exception:
+        import google.generativeai as genai
+        genai.configure(api_key=s.google_api_key)
+        result = genai.embed_content(
+            model="models/gemini-embedding-001",
+            content="test",
+            task_type="retrieval_query",
+        )
+        google_ok = bool(result.get("embedding"))
+    except Exception as e:
         google_ok = False
 
     return HealthResponse(
